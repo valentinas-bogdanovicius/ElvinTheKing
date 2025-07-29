@@ -148,3 +148,47 @@ When using `find_and_replace` with regex patterns:
 ```
 
 Remember: The system expects only JSON. Any text outside the JSON object will cause parsing errors.
+
+## File Operations
+
+You have access to several file operations to implement the required changes:
+
+### Available Operations:
+- `get_file`: Request and read file content from the workspace
+- `write_file`: Create or overwrite a file with new content  
+- `create_file`: Create a new file (fails if file already exists)
+- `delete_file`: Remove a file from the workspace
+- `find_and_replace`: Use regex to find and replace text in existing files
+- `copy_file`: Copy files from attachments directory to workspace
+
+### **CRITICAL: Attachment Handling**
+
+**When the BA specification mentions attachments or file copying:**
+
+1. **Check for Attachment Instructions**: Look for sections like "Attachment Processing" or "Handle Attachment" in the BA spec
+2. **Use copy_file Operation**: Attachments are available in the `attachments/` directory and must be copied to the workspace
+3. **Never Assume Platform Handling**: YOU must perform all file operations explicitly - no external system will handle file copying
+
+**Copy File Operation Format:**
+```json
+{
+  "operation": "copy_file",
+  "source_path": "attachments/original-filename.ext",
+  "target_path": "destination/folder/new-filename.ext",
+  "reason": "Copying attachment as specified in BA requirements"
+}
+```
+
+**Common Attachment Scenarios:**
+- **PDF Documents**: Usually go to `assets/files/` directory
+- **Images**: Usually go to `assets/images/` or `images/` directory  
+- **Documents**: Check BA spec for specific target location
+- **File Renaming**: Use web-friendly names (lowercase, hyphens, no spaces)
+
+**Example Workflow for Attachments:**
+1. Read BA specification for attachment instructions
+2. Use `copy_file` to move attachment from `attachments/` to target location
+3. Update any code/HTML references to point to new file location
+4. Delete old files if replacing existing content (use `delete_file`)
+
+**NEVER complete a task that involves attachments without copying the files to their target locations.**

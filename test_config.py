@@ -94,7 +94,7 @@ Line 5: Final line"""
         
         logger.info("✅ All tests passed! New file operation strategy is working correctly.")
         return True
-        
+            
     except Exception as e:
         logger.error(f"❌ Test failed: {e}")
         # Cleanup on failure

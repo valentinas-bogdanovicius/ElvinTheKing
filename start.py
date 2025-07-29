@@ -40,6 +40,12 @@ from dotenv import load_dotenv
 import patch
 import requests # Added for the new BA agent method
 
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
 
 @dataclass
 class JiraTicket:
@@ -60,10 +66,26 @@ class ConfigManager:
     
     def validate_config(self):
         """Validate that all required environment variables are present"""
+        # Determine which AI providers are being used
+        ba_provider = os.getenv('BA_AI_PROVIDER', os.getenv('AI_PROVIDER', 'gemini')).lower()
+        coding_provider = os.getenv('CODING_AI_PROVIDER', os.getenv('AI_PROVIDER', 'gemini')).lower()
+        
+        # Base required variables
         required_vars = [
             'JIRA_SERVER', 'JIRA_USERNAME', 'JIRA_API_TOKEN', 'JIRA_PROJECT_KEY',
-            'GEMINI_API_KEY', 'GIT_REPO_URL', 'GIT_WORKSPACE_PATH'
+            'GIT_REPO_URL', 'GIT_WORKSPACE_PATH'
         ]
+        
+        # Add AI provider specific requirements
+        providers_needed = set([ba_provider, coding_provider])
+        
+        if 'anthropic' in providers_needed:
+            if not ANTHROPIC_AVAILABLE:
+                raise ValueError("Anthropic provider selected but 'anthropic' package not installed. Run: pip install anthropic")
+            required_vars.append('ANTHROPIC_API_KEY')
+            
+        if 'gemini' in providers_needed:
+            required_vars.append('GEMINI_API_KEY')
         
         missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
@@ -86,8 +108,55 @@ class ConfigManager:
         return os.getenv('JIRA_PROJECT_KEY')
     
     @property
+    def ai_provider(self) -> str:
+        """Legacy property for backward compatibility"""
+        return os.getenv('AI_PROVIDER', 'gemini').lower()
+    
+    @property
+    def ba_ai_provider(self) -> str:
+        """AI provider for Business Analyst agent"""
+        return os.getenv('BA_AI_PROVIDER', os.getenv('AI_PROVIDER', 'gemini')).lower()
+    
+    @property
+    def coding_ai_provider(self) -> str:
+        """AI provider for Coding agent"""
+        return os.getenv('CODING_AI_PROVIDER', os.getenv('AI_PROVIDER', 'gemini')).lower()
+    
+    @property
     def gemini_api_key(self) -> str:
         return os.getenv('GEMINI_API_KEY')
+    
+    @property
+    def anthropic_api_key(self) -> str:
+        return os.getenv('ANTHROPIC_API_KEY')
+    
+    @property
+    def gemini_model(self) -> str:
+        return os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-exp')
+    
+    @property
+    def anthropic_model(self) -> str:
+        return os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022')
+    
+    @property
+    def ba_gemini_model(self) -> str:
+        """Gemini model for BA agent (can be different from coding model)"""
+        return os.getenv('BA_GEMINI_MODEL', self.gemini_model)
+    
+    @property
+    def ba_anthropic_model(self) -> str:
+        """Anthropic model for BA agent (can be different from coding model)"""
+        return os.getenv('BA_ANTHROPIC_MODEL', self.anthropic_model)
+    
+    @property
+    def coding_gemini_model(self) -> str:
+        """Gemini model for Coding agent (can be different from BA model)"""
+        return os.getenv('CODING_GEMINI_MODEL', self.gemini_model)
+    
+    @property
+    def coding_anthropic_model(self) -> str:
+        """Anthropic model for Coding agent (can be different from BA model)"""
+        return os.getenv('CODING_ANTHROPIC_MODEL', self.anthropic_model)
     
     @property
     def git_repo_url(self) -> str:
@@ -96,10 +165,6 @@ class ConfigManager:
     @property
     def git_workspace_path(self) -> str:
         return os.getenv('GIT_WORKSPACE_PATH', './workspace')
-    
-    @property
-    def gemini_model(self) -> str:
-        return os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-exp')
 
 
 class JiraManager:
@@ -149,14 +214,22 @@ class JiraManager:
                     with open(file_path, 'wb') as f:
                         f.write(attachment_content)
                     
-                    # Store attachment info
+                    # Store attachment info with proper MIME type handling
+                    mime_type = getattr(attachment, 'mimeType', 'unknown')
+                    
+                    # Ensure PDF files are properly recognized
+                    if safe_filename.lower().endswith('.pdf') and mime_type == 'unknown':
+                        mime_type = 'application/pdf'
+                    
                     attachments_info[str(file_path.name)] = {
                         'original_filename': attachment.filename,
                         'size': attachment.size,
-                        'mimetype': getattr(attachment, 'mimeType', 'unknown'),
+                        'content_type': mime_type,  # Use content_type consistently
+                        'mimetype': mime_type,      # Keep mimetype for backward compatibility
                         'created': str(attachment.created),
                         'author': str(attachment.author),
-                        'local_path': str(file_path)
+                        'local_path': str(file_path),
+                        'is_pdf': mime_type == 'application/pdf' or safe_filename.lower().endswith('.pdf')
                     }
                     
                     self.logger.info(f"Downloaded attachment: {attachment.filename} -> {file_path.name}")
@@ -1045,14 +1118,130 @@ class InstructionManager:
 
 
 class AIAgent:
-    """Handles interactions with Gemini AI API"""
+    """Handles interactions with AI APIs (Gemini and Anthropic) with separate providers for BA and Coding agents"""
     
     def __init__(self, config: ConfigManager):
         self.config = config
-        genai.configure(api_key=config.gemini_api_key)
-        self.model = genai.GenerativeModel(config.gemini_model)
         self.logger = logging.getLogger(__name__)
+        
+        # Initialize clients for both BA and Coding agents
+        self.ba_provider = config.ba_ai_provider
+        self.coding_provider = config.coding_ai_provider
+        
+        # Initialize Anthropic client if needed
+        if self.ba_provider == 'anthropic' or self.coding_provider == 'anthropic':
+            if not ANTHROPIC_AVAILABLE:
+                raise ValueError("Anthropic provider selected but 'anthropic' package not installed")
+            self.anthropic_client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+        
+        # Initialize Gemini client if needed
+        if self.ba_provider == 'gemini' or self.coding_provider == 'gemini':
+            genai.configure(api_key=config.gemini_api_key)
+            # We'll create model instances as needed since they might use different models
+        
+        self.logger.info(f"Initialized AIAgent - BA: {self.ba_provider}, Coding: {self.coding_provider}")
+        
+        # Log model configurations
+        if self.ba_provider == 'anthropic':
+            self.logger.info(f"BA Agent using Anthropic model: {config.ba_anthropic_model}")
+        else:
+            self.logger.info(f"BA Agent using Gemini model: {config.ba_gemini_model}")
+            
+        if self.coding_provider == 'anthropic':
+            self.logger.info(f"Coding Agent using Anthropic model: {config.coding_anthropic_model}")
+        else:
+            self.logger.info(f"Coding Agent using Gemini model: {config.coding_gemini_model}")
     
+    def _generate_content(self, prompt: str, max_tokens: int = 65535, agent_type: str = 'ba') -> str:
+        """Generate content using the configured AI provider for the specified agent type"""
+        if agent_type == 'ba':
+            provider = self.ba_provider
+        else:  # coding
+            provider = self.coding_provider
+            
+        if provider == 'anthropic':
+            return self._generate_anthropic_content(prompt, max_tokens, agent_type)
+        else:
+            return self._generate_gemini_content(prompt, max_tokens, agent_type)
+    
+    def _generate_anthropic_content(self, prompt: str, max_tokens: int = 4096, agent_type: str = 'ba') -> str:
+        """Generate content using Anthropic Claude with prompt caching support"""
+        try:
+            # Anthropic has a lower max token limit
+            actual_max_tokens = min(max_tokens, 4096)
+            
+            # Get the appropriate model for the agent type
+            if agent_type == 'ba':
+                model = self.config.ba_anthropic_model
+            else:
+                model = self.config.coding_anthropic_model
+            
+            # For backward compatibility, handle both structured and simple prompts
+            if isinstance(prompt, dict) and 'static_content' in prompt:
+                # New cacheable prompt structure
+                prompt_structure = self._build_cacheable_prompt(
+                    prompt['static_content'], 
+                    prompt['dynamic_content'], 
+                    agent_type
+                )
+                
+                # Build API call parameters
+                api_params = {
+                    "model": model,
+                    "max_tokens": actual_max_tokens,
+                    "temperature": 0.2,
+                    "extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"},
+                    "messages": prompt_structure["messages"]
+                }
+                
+                # Add system message if present
+                if prompt_structure["system"]:
+                    api_params["system"] = prompt_structure["system"]
+                
+            else:
+                # Legacy simple prompt - no caching
+                api_params = {
+                    "model": model,
+                    "max_tokens": actual_max_tokens,
+                    "temperature": 0.2,
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+            
+            # Use prompt caching beta API
+            response = self.anthropic_client.messages.create(**api_params)
+            
+            # Log cache performance metrics if available
+            if hasattr(response, 'usage'):
+                usage = response.usage
+                if hasattr(usage, 'cache_creation_input_tokens') and usage.cache_creation_input_tokens:
+                    self.logger.info(f"Anthropic {agent_type} agent - Cache write: {usage.cache_creation_input_tokens} tokens")
+                if hasattr(usage, 'cache_read_input_tokens') and usage.cache_read_input_tokens:
+                    self.logger.info(f"Anthropic {agent_type} agent - Cache read: {usage.cache_read_input_tokens} tokens")
+            
+            return response.content[0].text
+            
+        except Exception as e:
+            self.logger.error(f"Anthropic API error for {agent_type} agent: {e}")
+            raise ValueError(f"Anthropic API error: {e}")
+    
+    def _generate_gemini_content(self, prompt: str, max_tokens: int = 65535, agent_type: str = 'ba') -> str:
+        """Generate content using Gemini"""
+        try:
+            # Get the appropriate model for the agent type
+            if agent_type == 'ba':
+                model_name = self.config.ba_gemini_model
+            else:
+                model_name = self.config.coding_gemini_model
+            
+            # Create model instance with appropriate model
+            gemini_model = genai.GenerativeModel(model_name)
+            response = gemini_model.generate_content(prompt)
+            return response.text.strip()
+            
+        except Exception as e:
+            self.logger.error(f"Gemini API error for {agent_type} agent: {e}")
+            raise ValueError(f"Gemini API error: {e}")
+
     def _format_attachments_for_prompt(self, attachments_info: Dict[str, Dict]) -> str:
         """Format attachment information for inclusion in AI prompts"""
         if not attachments_info:
@@ -1060,7 +1249,13 @@ class AIAgent:
         
         formatted = []
         for filename, info in attachments_info.items():
-            formatted.append(f"- {filename} ({info['size']} bytes, {info['content_type']})")
+            try:
+                size = info.get('size', 'unknown size')
+                content_type = info.get('content_type', info.get('mimetype', 'unknown type'))
+                formatted.append(f"- {filename} ({size} bytes, {content_type})")
+            except Exception as e:
+                self.logger.warning(f"Error formatting attachment {filename}: {e}")
+                formatted.append(f"- {filename} (attachment info unavailable)")
         
         return "\n".join(formatted)
 
@@ -1111,82 +1306,62 @@ class AIAgent:
 
     def invoke_ba_agent(self, ticket: JiraTicket, instructions: str, codebase: str, 
                        temp_artifacts_path: Path, attachments_info: Dict[str, Dict] = None) -> str:
-        """
-        Invoke the BA agent with ticket and codebase context
-        Returns the BA specification as markdown text
-        """
+        """Invoke Business Analyst Agent to generate specifications with prompt caching"""
         
         try:
-            # Prepare prompt with all context
-            ticket_context = f"""
-JIRA TICKET: {ticket.key}
+            # Build static content (cacheable) - instructions and codebase structure
+            static_content = f"""{instructions}
+
+CODEBASE STRUCTURE AND CONTENT:
+{codebase}"""
+            
+            # Build dynamic content - ticket-specific information
+            ticket_context = f"""JIRA TICKET: {ticket.key}
 Summary: {ticket.summary}
 Description: {ticket.description}
 
 Comments:
-{chr(10).join([f"- {comment}" for comment in ticket.comments])}
-"""
+{chr(10).join([f"- {comment}" for comment in ticket.comments])}"""
             
             # Add attachments information if available
             attachments_context = ""
             if attachments_info:
                 attachments_context = f"""
 ATTACHMENTS:
-{self._format_attachments_for_prompt(attachments_info)}
-"""
+{self._format_attachments_for_prompt(attachments_info)}"""
             
-            prompt = f"""
-{instructions}
-
-{ticket_context}
+            dynamic_content = f"""{ticket_context}
 
 {attachments_context}
 
-CODEBASE STRUCTURE AND CONTENT:
-{codebase}
-
-Please provide your business analysis following the markdown format specified in the instructions.
-"""
+Please provide your business analysis following the markdown format specified in the instructions."""
             
-            # Create Gemini request
-            request_data = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.5,
-                    "topK": 40,
-                    "topP": 0.95,
-                    "maxOutputTokens": 65535
+            # Use cacheable prompt structure for Anthropic agents
+            if self.ba_provider == 'anthropic':
+                prompt = {
+                    'static_content': static_content,
+                    'dynamic_content': dynamic_content
                 }
-            }
+            else:
+                # Gemini fallback - combine content as before
+                prompt = f"{static_content}\n\n{dynamic_content}"
             
-            # Make API call
-            response = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={self.config.gemini_api_key}",
-                headers={"Content-Type": "application/json"},
-                json=request_data,
-                timeout=180
-            )
+            # Use unified content generation method
+            response_text = self._generate_content(prompt, max_tokens=65535, agent_type='ba')
             
-            if response.status_code != 200:
-                raise ValueError(f"Gemini API error: {response.status_code} - {response.text}")
+            # Log response to temp artifacts
+            ba_log_file = temp_artifacts_path / f"{ticket.key}_ba_response.txt"
+            with open(ba_log_file, 'w', encoding='utf-8') as f:
+                f.write(response_text)
+
             
-            response_data = response.json()
-            if 'candidates' not in response_data or not response_data['candidates']:
-                raise ValueError(f"No response from Gemini API: {response_data}")
-            
-            response_text = response_data['candidates'][0]['content']['parts'][0]['text'].strip()
-            
-            # Write raw response to log file
-            log_file_path = temp_artifacts_path / f"{ticket.key}_ba_response.txt"
-            with open(log_file_path, "w", encoding="utf-8") as log_file:
-                log_file.write(response_text)
-            
+            self.logger.info(f"BA Agent response logged to {ba_log_file}")
             self.logger.info("BA Agent generated specification successfully")
             return response_text
             
         except Exception as e:
             self.logger.error(f"BA Agent invocation failed: {e}")
-            raise ValueError(f"BA Agent failed: {e}")
+            raise
     
     def invoke_coding_agent_iterative(self, ticket: JiraTicket, ba_spec: str, 
                                       instructions: str, git_manager: 'GitManager', 
@@ -1206,16 +1381,11 @@ Please provide your business analysis following the markdown format specified in
                 self.logger.info(f"Coding Agent conversation turn {turn_number}")
                 
                 # Build context for this turn with project structure but not full content
-                full_context = f"""You are an expert Coding Agent. Follow the instructions below to implement the changes specified in the BA specification.
+                # Separate static (cacheable) from dynamic content
+                static_content = f"""You are an expert Coding Agent. Follow the instructions below to implement the changes specified in the BA specification.
 
 **INSTRUCTIONS:**
 {instructions}
-
-**ORIGINAL JIRA TICKET:**
-- Key: {ticket.key}
-- Summary: {ticket.summary}
-- Description: {ticket.description}
-- Comments: {chr(10).join(f"- {comment}" for comment in ticket.comments)}
 
 **BA SPECIFICATION:**
 {ba_spec}
@@ -1229,7 +1399,13 @@ Please provide your business analysis following the markdown format specified in
 - Use "get_file" operation to request specific files you need to examine in detail
 - Use "find_and_replace" operation for precise modifications using regex patterns
 - Work incrementally: examine reference files first, understand patterns, then make targeted changes
-- **For text replacements**: Use regex patterns to find and replace content flexibly, handling variations in whitespace and formatting
+- **For text replacements**: Use regex patterns to find and replace content flexibly, handling variations in whitespace and formatting"""
+
+                dynamic_content = f"""**ORIGINAL JIRA TICKET:**
+- Key: {ticket.key}
+- Summary: {ticket.summary}
+- Description: {ticket.description}
+- Comments: {chr(10).join(f"- {comment}" for comment in ticket.comments)}
 
 --- CONVERSATION HISTORY ---
 {chr(10).join(conversation_history) if conversation_history else "No previous conversation."}
@@ -1237,8 +1413,18 @@ Please provide your business analysis following the markdown format specified in
 
 Start by requesting the files you need to examine, then make the necessary changes. Signal completion when all BA requirements are fulfilled."""
                 
-                response = self.model.generate_content(full_context)
-                response_text = response.text.strip()
+                # Use cacheable prompt structure for Anthropic agents
+                if self.coding_provider == 'anthropic':
+                    full_context = {
+                        'static_content': static_content,
+                        'dynamic_content': dynamic_content
+                    }
+                else:
+                    # Gemini fallback - combine content as before
+                    full_context = f"{static_content}\n\n{dynamic_content}"
+                
+                response = self._generate_content(full_context, agent_type='coding')
+                response_text = response.strip()
                 
                 # Log this turn's response
                 turn_log_file = temp_artifacts_path / f"{ticket.key}_coder_turn_{turn_number}.txt"
@@ -1323,11 +1509,31 @@ Start by requesting the files you need to examine, then make the necessary chang
                         
                         self.logger.info(f"Coding agent requested file: {file_path} - {reason}")
                         
-                        # Algorithmic restraint: prevent infinite loops
-                        if last_get_file_request == file_path and file_path not in file_modification_tracking:
-                            self.logger.warning(f"Agent requested same file '{file_path}' twice in a row without changes - terminating to prevent loop")
+                        # Enhanced redundant file request prevention
+                        file_request_count = sum(1 for turn in conversation_history[-10:] 
+                                               if f"requested file: {file_path}" in turn or 
+                                                  f"File '{file_path}' content:" in turn)
+                        
+                        # Prevent excessive file requests (more than 3 requests without modifications)
+                        if (file_request_count >= 3 and 
+                            file_path not in file_modification_tracking and
+                            file_path in provided_files):
+                            
+                            self.logger.warning(f"Agent requested file '{file_path}' {file_request_count + 1} times without modifications - preventing redundant request")
                             conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
-                            conversation_history.append(f"SYSTEM: AUTOMATIC TERMINATION - You requested the same file '{file_path}' twice in a row without making any changes. This suggests you may be stuck in a loop. Please review the BA specification and focus on the specific task requirements.")
+                            conversation_history.append(f"SYSTEM: EFFICIENCY NOTICE - You've already requested '{file_path}' {file_request_count} times without making changes. The file content remains available from previous requests. Please proceed with your changes or focus on other files. If you need the content again, it was:\n\n```\n{provided_files[file_path]}\n```\n\nConsider making your changes now or requesting different files.")
+                            continue
+                        
+                        # Algorithmic restraint: prevent infinite loops (less aggressive)
+                        # Only terminate after 4+ consecutive requests of the same file without changes
+                        consecutive_requests = 1
+                        if last_get_file_request == file_path:
+                            consecutive_requests += 1
+                        
+                        if consecutive_requests >= 4 and file_path not in file_modification_tracking:
+                            self.logger.warning(f"Agent requested same file '{file_path}' {consecutive_requests} times consecutively without changes - terminating to prevent loop")
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM: AUTOMATIC TERMINATION - You requested the same file '{file_path}' {consecutive_requests} times consecutively without making any changes. This suggests you may be stuck in a loop. Please review the BA specification and make the required changes.")
                             break
                         
                         last_get_file_request = file_path
@@ -1468,15 +1674,13 @@ Start by requesting the files you need to examine, then make the necessary chang
                             conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
                             conversation_history.append(f"SYSTEM ERROR: Could not perform find_and_replace in '{file_path}': {str(e)}")
                     
-                    else:
-                        # Handle traditional file operations (write_file, create_file, delete_file, copy_file)
-                        file_changes.append(operation_request)
-                    
-                    # Log received operation based on type
-                    if operation == 'copy_file':
+                    elif operation == 'copy_file':
                         source_path = operation_request.get('source_path')
                         target_path = operation_request.get('target_path')
                         self.logger.info(f"Received {operation} operation: {source_path} -> {target_path}")
+                        
+                        # CRITICAL FIX: Add operation to file_changes so it gets executed
+                        file_changes.append(operation_request)
                         
                         # Update cache for copied file - remove it since we don't know the new content without reading
                         if target_path in provided_files:
@@ -1491,6 +1695,9 @@ Start by requesting the files you need to examine, then make the necessary chang
                         file_content = operation_request.get('file_content', '')
                         self.logger.info(f"Received {operation} operation for: {file_path}")
                         
+                        # CRITICAL FIX: Add operation to file_changes so it gets executed
+                        file_changes.append(operation_request)
+                        
                         # Update cache with new content for write/create operations
                         provided_files[file_path] = file_content
                         file_modification_tracking[file_path] = True
@@ -1502,6 +1709,9 @@ Start by requesting the files you need to examine, then make the necessary chang
                         file_path = operation_request.get('file_path')
                         self.logger.info(f"Received {operation} operation for: {file_path}")
                         
+                        # CRITICAL FIX: Add operation to file_changes so it gets executed
+                        file_changes.append(operation_request)
+                        
                         # Remove from cache since file is deleted
                         if file_path in provided_files:
                             del provided_files[file_path]
@@ -1510,6 +1720,24 @@ Start by requesting the files you need to examine, then make the necessary chang
                         conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
                         conversation_history.append(f"SYSTEM: {operation} operation for '{file_path}' completed successfully. Is there anything else needed to fulfill the BA specification, or are you ready to respond with 'CHANGES DONE'?")
                     
+                    elif operation == 'find_and_replace':
+                        file_path = operation_request.get('file_path')
+                        find_regex = operation_request.get('find_regex')
+                        replace_text = operation_request.get('replace_text')
+                        if not file_path:
+                            failed_operations.append(f"unknown: Missing file_path for find_and_replace operation")
+                            continue
+                        if not find_regex:
+                            failed_operations.append(f"{file_path}: Missing find_regex for find_and_replace operation")
+                            continue
+                        if replace_text is None:
+                            failed_operations.append(f"{file_path}: Missing replace_text for find_and_replace operation")
+                            continue
+                        success, message = self.git_manager.find_and_replace_in_file(file_path, find_regex, replace_text)
+                        if not success:
+                            failed_operations.append(f"{file_path}: {message}")
+                            continue
+                        
                     else:
                         # Unknown operation
                         conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
@@ -1543,7 +1771,10 @@ Start by requesting the files you need to examine, then make the necessary chang
             
         except Exception as e:
             self.logger.error(f"Coding Agent iterative invocation failed: {e}")
-            return []
+            return {
+                'file_changes': [],
+                'completion_summary': f'Error: {str(e)}'
+            }
     
     def _validate_operation_request(self, operation_request: Dict) -> bool:
         """Validate that operation request has required fields for the specified operation"""
@@ -1629,8 +1860,8 @@ Start by requesting the files you need to examine, then make the necessary chang
 Based on the BA specification and current codebase, produce ONLY the JSON object with unified diff patches as defined in your instructions. No additional text or explanation."""
 
         try:
-            response = self.model.generate_content(prompt)
-            response_text = response.text.strip()
+            response = self._generate_content(prompt, agent_type='coding')
+            response_text = response.strip()
             
             # Log full response to temp_artifacts (before any processing)
             coder_log_file = temp_artifacts_path / f"{ticket.key}_coder_response.txt"
@@ -1675,6 +1906,42 @@ FILE: {file_path}
 """)
         
         return "\n".join(sections)
+
+    def _build_cacheable_prompt(self, static_content: str, dynamic_content: str, agent_type: str = 'ba') -> dict:
+        """Build a prompt structure optimized for Claude prompt caching"""
+        
+        # Ensure static content meets minimum token requirements for caching
+        # Claude 3.5 Sonnet and Opus: 1024 tokens minimum
+        # Claude 3 Haiku: 2048 tokens minimum
+        model_name = self.config.ba_anthropic_model if agent_type == 'ba' else self.config.coding_anthropic_model
+        min_tokens = 2048 if 'haiku' in model_name.lower() else 1024
+        
+        # Rough token estimation (1 token ≈ 4 characters)
+        estimated_tokens = len(static_content) // 4
+        
+        if estimated_tokens >= min_tokens:
+            # Use system message with caching for static content
+            return {
+                "system": [
+                    {
+                        "type": "text",
+                        "text": static_content,
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ],
+                "messages": [
+                    {"role": "user", "content": dynamic_content}
+                ]
+            }
+        else:
+            # Fallback to regular user message if content too small for caching
+            combined_content = f"{static_content}\n\n{dynamic_content}"
+            return {
+                "system": None,
+                "messages": [
+                    {"role": "user", "content": combined_content}
+                ]
+            }
 
 
 class LocalServerManager:
@@ -1860,6 +2127,7 @@ class OrchestratorScript:
             self.jira_manager.add_comment(ticket_key, f"Automated processing failed: {error_message}")
             # Transition to "Pending" on failure/error (allows for retry)
             self.jira_manager.transition_ticket(ticket_key, "Pending")
+            self.logger.info(f"Successfully transitioned ticket {ticket_key} to Pending")
             self.logger.error(f"Marked ticket {ticket_key} as pending due to: {error_message}")
         except Exception as e:
             self.logger.error(f"Failed to update ticket {ticket_key} with pending status: {e}")
@@ -1959,11 +2227,18 @@ class OrchestratorScript:
             if ticket.specified_branch:
                 self.logger.info(f"Ticket specifies branch: {ticket.specified_branch}")
             
-            # 1.5. Download ticket attachments
+            # 1.5. Download ticket attachments (non-critical)
             self.logger.info("Downloading ticket attachments")
-            attachments_info = self.jira_manager.download_ticket_attachments(ticket.key, self.attachments_path)
-            if attachments_info:
-                self.logger.info(f"Downloaded {len(attachments_info)} attachment(s)")
+            attachments_info = {}
+            try:
+                attachments_info = self.jira_manager.download_ticket_attachments(ticket.key, self.attachments_path)
+                if attachments_info:
+                    self.logger.info(f"Downloaded {len(attachments_info)} attachment(s)")
+                else:
+                    self.logger.info("No attachments found for ticket")
+            except Exception as e:
+                self.logger.warning(f"Failed to download attachments (non-critical): {e}")
+                attachments_info = {}  # Continue without attachments
             
             # 2. Prepare Workspace with specified or main branch
             self.logger.info("Preparing Git workspace")
@@ -2068,6 +2343,24 @@ class OrchestratorScript:
                                 continue
                             success = self.git_manager.copy_file(source_path, target_path, self.attachments_path)
                             
+                        elif operation == 'find_and_replace':
+                            file_path = change.get('file_path')
+                            find_regex = change.get('find_regex')
+                            replace_text = change.get('replace_text')
+                            if not file_path:
+                                failed_operations.append(f"unknown: Missing file_path for find_and_replace operation")
+                                continue
+                            if not find_regex:
+                                failed_operations.append(f"{file_path}: Missing find_regex for find_and_replace operation")
+                                continue
+                            if replace_text is None:
+                                failed_operations.append(f"{file_path}: Missing replace_text for find_and_replace operation")
+                                continue
+                            success, message = self.git_manager.find_and_replace_in_file(file_path, find_regex, replace_text)
+                            if not success:
+                                failed_operations.append(f"{file_path}: {message}")
+                                continue
+                            
                         else:
                             failed_operations.append(f"unknown: Unknown operation '{operation}'")
                             continue
@@ -2075,14 +2368,14 @@ class OrchestratorScript:
                         if success:
                             if operation == 'copy_file':
                                 successful_operations.append(f"{operation}:{source_path}->{target_path}")
-                            elif operation in ['write_file', 'create_file', 'delete_file']:
+                            elif operation in ['write_file', 'create_file', 'delete_file', 'find_and_replace']:
                                 successful_operations.append(f"{operation}:{file_path}")
                             else:
                                 successful_operations.append(f"{operation}:unknown")
                         else:
                             if operation == 'copy_file':
                                 failed_operations.append(f"{target_path}: {operation} operation failed")
-                            elif operation in ['write_file', 'create_file', 'delete_file']:
+                            elif operation in ['write_file', 'create_file', 'delete_file', 'find_and_replace']:
                                 failed_operations.append(f"{file_path}: {operation} operation failed")
                             else:
                                 failed_operations.append(f"unknown: {operation} operation failed")
@@ -2187,6 +2480,7 @@ Ready for review and testing."""
                 # - "Resolved": Set on successful implementation completion
                 # - "Pending": Set on failure/error (handled in handle_failure method)
                 self.jira_manager.transition_ticket(ticket.key, "Resolved")
+                self.logger.info(f"Successfully transitioned ticket {ticket.key} to Resolved")
                 
                 self.logger.info(f"Successfully processed ticket {ticket.key}")
                 
@@ -2215,9 +2509,21 @@ Ready for review and testing."""
                 self.server_manager.stop_server()
         except Exception as e:
             self.logger.error(f"Unexpected error in orchestrator: {e}")
-            if self.server_manager:
-                self.server_manager.stop_server()
-            sys.exit(1)
+            # Get the ticket key if available for proper error handling
+            ticket_key = None
+            try:
+                if 'ticket' in locals() and ticket:
+                    ticket_key = ticket.key
+            except:
+                pass
+            
+            if ticket_key:
+                self.handle_failure(ticket_key, f"Unexpected error in orchestrator: {str(e)}")
+            else:
+                self.logger.error("No ticket available for failure handling")
+                if self.server_manager:
+                    self.server_manager.stop_server()
+                sys.exit(1)
 
 
 def main():
