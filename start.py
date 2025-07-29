@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+import base64
+import requests
 
 # Third-party imports
 import google.generativeai as genai
@@ -235,23 +237,51 @@ class JiraManager:
             raise
     
     def transition_ticket(self, ticket_key: str, status: str):
-        """Transition ticket to the specified status"""
+        """Transition ticket to the specified status using Jira REST API"""
         try:
-            # Get available transitions
-            transitions = self.jira.transitions(ticket_key)
+            # First, get available transitions for the issue
+            transitions_url = f"{self.config.jira_server}/rest/api/3/issue/{ticket_key}/transitions"
+            headers = {
+                'Accept': 'application/json',
+                'Authorization': f'Basic {base64.b64encode(f"{self.config.jira_username}:{self.config.jira_api_token}".encode()).decode()}'
+            }
+            
+            response = requests.get(transitions_url, headers=headers)
+            response.raise_for_status()
+            
+            transitions_data = response.json()
             transition_id = None
             
-            for transition in transitions:
-                if transition['name'].lower() == status.lower():
-                    transition_id = transition['id']
+            # Find the transition that matches the target status
+            for transition in transitions_data.get('transitions', []):
+                if transition.get('to', {}).get('name', '').lower() == status.lower():
+                    transition_id = transition.get('id')
                     break
             
-            if transition_id:
-                self.jira.transition_issue(ticket_key, transition_id)
-                self.logger.info(f"Transitioned ticket {ticket_key} to {status}")
-            else:
-                self.logger.warning(f"Status '{status}' not available for ticket {ticket_key}")
+            if not transition_id:
+                # Log available transitions for debugging
+                available_transitions = [t.get('to', {}).get('name', 'Unknown') for t in transitions_data.get('transitions', [])]
+                self.logger.warning(f"Status '{status}' not available for ticket {ticket_key}. Available transitions: {available_transitions}")
+                return
+            
+            # Perform the transition
+            transition_url = f"{self.config.jira_server}/rest/api/3/issue/{ticket_key}/transitions"
+            transition_data = {
+                "transition": {
+                    "id": transition_id
+                }
+            }
+            
+            response = requests.post(transition_url, headers=headers, json=transition_data)
+            response.raise_for_status()
+            
+            self.logger.info(f"Successfully transitioned ticket {ticket_key} to {status}")
                 
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Failed to transition ticket {ticket_key} to {status}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                self.logger.error(f"Response status: {e.response.status_code}")
+                self.logger.error(f"Response body: {e.response.text}")
         except Exception as e:
             self.logger.error(f"Failed to transition ticket {ticket_key} to {status}: {e}")
             raise
@@ -487,6 +517,50 @@ class GitManager:
             self.logger.error(f"Failed to create/switch to branch {branch_name}: {e}")
             raise
     
+    def get_codebase_structure(self) -> str:
+        """Get a formatted string representation of the codebase structure"""
+        structure_lines = []
+        
+        # Define directories/files to exclude
+        exclude_patterns = {
+            '.git', '__pycache__', '.pytest_cache', 'node_modules', 
+            '.vscode', '.idea', 'venv', 'env', '.env'
+        }
+        
+        try:
+            # Get all files and directories
+            all_items = list(self.workspace_path.rglob('*'))
+            
+            # Sort items for consistent output
+            all_items.sort(key=lambda x: str(x))
+            
+            for item_path in all_items:
+                # Skip if in excluded patterns
+                if any(pattern in str(item_path) for pattern in exclude_patterns):
+                    continue
+                
+                # Calculate relative path and depth
+                relative_path = item_path.relative_to(self.workspace_path)
+                depth = len(relative_path.parts)
+                
+                # Create indentation based on depth
+                indent = "  " * (depth - 1) if depth > 1 else ""
+                
+                # Add appropriate symbol
+                if item_path.is_dir():
+                    structure_lines.append(f"{indent}📁 {relative_path.name}/")
+                else:
+                    structure_lines.append(f"{indent}📄 {relative_path.name}")
+            
+            if structure_lines:
+                return "Project Structure:\n" + "\n".join(structure_lines)
+            else:
+                return "Project Structure: No files found"
+                
+        except Exception as e:
+            self.logger.error(f"Failed to get codebase structure: {e}")
+            return "Project Structure: Error reading structure"
+    
     def get_all_file_contents(self) -> Dict[str, str]:
         """Read all text files in the workspace and return as dict"""
         file_contents = {}
@@ -630,6 +704,130 @@ class GitManager:
             self.logger.error(f"Error writing file {file_path}: {e}")
             return False
     
+    def get_file_content(self, file_path: str) -> Optional[str]:
+        """Get the content of a specific file in the workspace"""
+        try:
+            target_path = self.workspace_path / file_path
+            
+            if not target_path.exists():
+                self.logger.warning(f"File does not exist: {file_path}")
+                return None
+            
+            # Skip if file is too large (>1MB)
+            if target_path.stat().st_size > 1024 * 1024:
+                self.logger.warning(f"File too large to read: {file_path}")
+                return f"[FILE TOO LARGE - {target_path.stat().st_size} bytes]"
+            
+            with open(target_path, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                content = f.read()
+            
+            self.logger.info(f"Successfully read file: {file_path}")
+            return content
+            
+        except Exception as e:
+            self.logger.error(f"Error reading file {file_path}: {e}")
+            return None
+    
+    def replace_file_lines(self, file_path: str, start_line: int, end_line: int, new_content: str) -> Tuple[bool, Optional[str]]:
+        """Replace specific lines in a file with new content. Returns (success, updated_file_content)"""
+        try:
+            target_path = self.workspace_path / file_path
+            
+            # Read current file content
+            if not target_path.exists():
+                self.logger.warning(f"File does not exist: {file_path}")
+                return False, None
+            
+            with open(target_path, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                lines = f.readlines()
+            
+            # Log current file state for debugging
+            self.logger.info(f"File {file_path} has {len(lines)} lines. Replacing lines {start_line}-{end_line}")
+            
+            # Validate line numbers (1-indexed)
+            if start_line < 1 or end_line < 1 or start_line > len(lines) + 1 or end_line > len(lines):
+                self.logger.error(f"Invalid line numbers: {start_line}-{end_line} for file with {len(lines)} lines")
+                return False, None
+            
+            # Validate start_line <= end_line
+            if start_line > end_line:
+                self.logger.error(f"Invalid range: start_line ({start_line}) > end_line ({end_line})")
+                return False, None
+            
+            # Prevent massive replacements that suggest the agent is confused
+            lines_to_replace = end_line - start_line + 1
+            if lines_to_replace > len(lines) * 0.8:  # More than 80% of the file
+                self.logger.error(f"Refusing to replace {lines_to_replace} lines ({lines_to_replace/len(lines)*100:.1f}% of file) - this suggests the agent should use create_file instead")
+                return False, None
+            
+            # Log what content is being replaced for debugging
+            self.logger.info(f"Replacing content from line {start_line} to {end_line}:")
+            for i in range(start_line - 1, min(end_line, len(lines))):
+                self.logger.info(f"  Line {i+1}: {lines[i].rstrip()}")
+            
+            # Convert to 0-indexed for list operations
+            start_idx = start_line - 1
+            end_idx = end_line - 1
+            
+            # Prepare new content - ensure it ends with newline if file is not empty
+            new_lines = []
+            if new_content:
+                # Split new content into lines, preserving any existing newlines
+                new_lines = new_content.splitlines(keepends=True)
+                # Ensure proper newline handling
+                if new_lines:
+                    # If the last line doesn't end with newline, add one
+                    if not new_lines[-1].endswith('\n'):
+                        new_lines[-1] += '\n'
+                else:
+                    # If new_content is empty, create an empty line
+                    new_lines = ['\n']
+            
+            # Log new content being inserted
+            self.logger.info(f"Inserting {len(new_lines)} new lines:")
+            for i, line in enumerate(new_lines):
+                self.logger.info(f"  New line {i+1}: {line.rstrip()}")
+            
+            # Perform the replacement
+            updated_lines = lines[:start_idx] + new_lines + lines[end_idx + 1:]
+            
+            # Basic HTML structure validation for HTML files
+            if file_path.endswith(('.htm', '.html')):
+                updated_content_str = ''.join(updated_lines)
+                # Check for basic HTML structure issues
+                if '<head>' in updated_content_str and '</head>' not in updated_content_str:
+                    self.logger.warning(f"HTML validation warning: Missing </head> tag after replacement in {file_path}")
+                if '<body>' in updated_content_str and '</body>' not in updated_content_str:
+                    self.logger.warning(f"HTML validation warning: Missing </body> tag after replacement in {file_path}")
+                if updated_content_str.count('<div') != updated_content_str.count('</div>'):
+                    self.logger.warning(f"HTML validation warning: Unmatched div tags after replacement in {file_path}")
+                
+                # Check for orphaned closing tags (critical structural errors)
+                orphaned_tags = []
+                if '</header>' in updated_content_str and '<header' not in updated_content_str:
+                    orphaned_tags.append('</header>')
+                if '</nav>' in updated_content_str and '<nav' not in updated_content_str:
+                    orphaned_tags.append('</nav>')
+                if '</section>' in updated_content_str and '<section' not in updated_content_str:
+                    orphaned_tags.append('</section>')
+                
+                if orphaned_tags:
+                    self.logger.error(f"HTML validation ERROR: Orphaned closing tags found in {file_path}: {orphaned_tags}")
+                    return False, f"HTML validation failed: Orphaned closing tags found: {orphaned_tags}. This would create invalid HTML structure."
+            
+            # Write back to file
+            with open(target_path, 'w', encoding='utf-8', newline='') as f:
+                f.writelines(updated_lines)
+            
+            # Return success and the updated content
+            updated_content = ''.join(updated_lines)
+            self.logger.info(f"Successfully replaced lines {start_line}-{end_line} in file: {file_path}. New file has {len(updated_lines)} lines")
+            return True, updated_content
+            
+        except Exception as e:
+            self.logger.error(f"Error replacing lines in file {file_path}: {e}")
+            return False, None
+    
     def apply_patch_to_file(self, file_path: str, patch_content: str) -> bool:
         """Apply a unified diff patch to a file with a robust method. Returns True if successful."""
         full_file_path = self.workspace_path / file_path
@@ -754,6 +952,62 @@ class GitManager:
         except Exception as e:
             self.logger.error(f"Failed to push branch {branch_name}: {e}")
             raise
+
+    def find_and_replace_in_file(self, file_path: str, find_regex: str, replace_text: str) -> Tuple[bool, str]:
+        """
+        Find and replace text in a file using regex patterns
+        
+        Args:
+            file_path: Path to the file relative to workspace
+            find_regex: Regex pattern to find
+            replace_text: Text to replace it with
+            
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        import re
+        
+        try:
+            full_path = self.workspace_path / file_path
+            
+            if not full_path.exists():
+                return False, f"File {file_path} does not exist"
+            
+            # Read current content
+            with open(full_path, 'r', encoding='utf-8') as f:
+                current_content = f.read()
+            
+            # Compile regex pattern
+            try:
+                pattern = re.compile(find_regex, re.MULTILINE | re.DOTALL)
+            except re.error as e:
+                return False, f"Invalid regex pattern: {str(e)}"
+            
+            # Check if pattern matches
+            matches = pattern.findall(current_content)
+            if not matches:
+                return False, f"Regex pattern not found in {file_path}. Pattern: {find_regex}"
+            
+            # Check if pattern matches multiple times
+            if len(matches) > 1:
+                return False, f"Regex pattern matches {len(matches)} times in {file_path}. Please make your pattern more specific to match only one instance."
+            
+            # Perform replacement
+            new_content = pattern.sub(replace_text, current_content)
+            
+            # Write back to file
+            with open(full_path, 'w', encoding='utf-8', newline='') as f:
+                f.write(new_content)
+            
+            self.logger.info(f"Successfully replaced text in {file_path} using regex")
+            self.logger.info(f"Regex pattern: {repr(find_regex[:100])}{'...' if len(find_regex) > 100 else ''}")
+            self.logger.info(f"Replace text: {repr(replace_text[:100])}{'...' if len(replace_text) > 100 else ''}")
+            
+            return True, f"Successfully replaced text in {file_path} using regex pattern"
+            
+        except Exception as e:
+            self.logger.error(f"Error in find_and_replace for {file_path}: {e}")
+            return False, f"Error replacing text in {file_path}: {str(e)}"
 
 
 class InstructionManager:
@@ -898,10 +1152,10 @@ Please provide your business analysis following the markdown format specified in
             request_data = {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
-                    "temperature": 0.1,
+                    "temperature": 0.5,
                     "topK": 40,
-                    "topP": 0.8,
-                    "maxOutputTokens": 8192
+                    "topP": 0.95,
+                    "maxOutputTokens": 65535
                 }
             }
             
@@ -935,22 +1189,23 @@ Please provide your business analysis following the markdown format specified in
             raise ValueError(f"BA Agent failed: {e}")
     
     def invoke_coding_agent_iterative(self, ticket: JiraTicket, ba_spec: str, 
-                                      instructions: str, codebase: Dict[str, str], 
+                                      instructions: str, git_manager: 'GitManager', 
                                       temp_artifacts_path: Path) -> List[Dict[str, Any]]:
         """Invoke the Coding Agent with iterative conversation approach"""
         
-        # Prepare codebase section for context
-        codebase_section = self._format_codebase_for_prompt(codebase)
-        
         file_changes = []
         conversation_history = []  # Track only assistant responses and system messages
+        provided_files = {}  # Cache of files already provided to agent {file_path: content}
+        file_modification_tracking = {}  # Track if files were modified since last provided
+        last_get_file_request = None  # Algorithmic restraint to prevent infinite loops
+        last_replace_operation = None  # Track last replace operation to prevent loops
         turn_number = 1
         
         try:
             while True:
                 self.logger.info(f"Coding Agent conversation turn {turn_number}")
                 
-                # Build full context for this turn (includes original context + conversation history)
+                # Build context for this turn with project structure but not full content
                 full_context = f"""You are an expert Coding Agent. Follow the instructions below to implement the changes specified in the BA specification.
 
 **INSTRUCTIONS:**
@@ -965,21 +1220,22 @@ Please provide your business analysis following the markdown format specified in
 **BA SPECIFICATION:**
 {ba_spec}
 
-**CURRENT CODEBASE CONTENT:**
-{codebase_section}
+**PROJECT STRUCTURE:**
+{git_manager.get_codebase_structure()}
 
-Based on the BA specification and current codebase, implement the required changes. Provide one complete file per response following the format specified in your instructions.
-
-IMPORTANT: After each successful operation, evaluate if the BA specification requirements are fulfilled:
-- For single-file tasks: Usually complete after one operation
-- For multi-file tasks: Continue until all mentioned files are addressed
-- Check the "Files to Modify" section and "Acceptance Criteria" in the BA spec
+**IMPORTANT NOTES:**
+- You have access to the complete project structure above
+- **MANDATORY: Review ALL files listed in the BA's "Files to Review" section FIRST** - these show you the correct patterns and examples
+- Use "get_file" operation to request specific files you need to examine in detail
+- Use "find_and_replace" operation for precise modifications using regex patterns
+- Work incrementally: examine reference files first, understand patterns, then make targeted changes
+- **For text replacements**: Use regex patterns to find and replace content flexibly, handling variations in whitespace and formatting
 
 --- CONVERSATION HISTORY ---
 {chr(10).join(conversation_history) if conversation_history else "No previous conversation."}
 --- END CONVERSATION HISTORY ---
 
-Evaluate: Is there anything else needed to fulfill the BA specification requirements?"""
+Start by requesting the files you need to examine, then make the necessary changes. Signal completion when all BA requirements are fulfilled."""
                 
                 response = self.model.generate_content(full_context)
                 response_text = response.text.strip()
@@ -993,6 +1249,7 @@ Evaluate: Is there anything else needed to fulfill the BA specification requirem
                 
                 # Check for completion signal
                 is_complete = False
+                completion_summary = ""
                 
                 # Method 1: Plain "CHANGES DONE" string
                 if response_text.strip() == "CHANGES DONE":
@@ -1001,6 +1258,10 @@ Evaluate: Is there anything else needed to fulfill the BA specification requirem
                 # Method 2: "CHANGES DONE" anywhere in the response (case insensitive)
                 elif "CHANGES DONE" in response_text.upper():
                     is_complete = True
+                    # Try to extract summary from plain text format
+                    if "Summary:" in response_text:
+                        summary_start = response_text.find("Summary:")
+                        completion_summary = response_text[summary_start:].strip()
                 
                 # Method 3: JSON with operation "complete"
                 else:
@@ -1008,7 +1269,33 @@ Evaluate: Is there anything else needed to fulfill the BA specification requirem
                         json_content = self._extract_json_from_response(response_text)
                         parsed_response = json.loads(json_content)
                         if parsed_response.get('operation') == 'complete':
+                            # Before accepting completion, validate any HTML files that were modified
+                            html_validation_errors = []
+                            for change in file_changes:
+                                if change.get('file_path', '').endswith(('.htm', '.html')):
+                                    file_path = change.get('file_path')
+                                    try:
+                                        current_content = git_manager.get_file_content(file_path)
+                                        if current_content:
+                                            # Check for orphaned closing tags
+                                            if '</header>' in current_content and '<header' not in current_content:
+                                                html_validation_errors.append(f"{file_path}: orphaned </header> tag")
+                                            if '</nav>' in current_content and '<nav' not in current_content:
+                                                html_validation_errors.append(f"{file_path}: orphaned </nav> tag")
+                                            if '</section>' in current_content and '<section' not in current_content:
+                                                html_validation_errors.append(f"{file_path}: orphaned </section> tag")
+                                    except Exception as e:
+                                        self.logger.warning(f"Could not validate HTML file {file_path}: {e}")
+                            
+                            if html_validation_errors:
+                                self.logger.error(f"HTML validation failed on completion: {html_validation_errors}")
+                                conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                                conversation_history.append(f"SYSTEM ERROR: Cannot complete - HTML validation failed. The following files have structural errors: {'; '.join(html_validation_errors)}. Please fix these issues before completing.")
+                                continue
+                            
                             is_complete = True
+                            # Extract summary from JSON
+                            completion_summary = parsed_response.get('summary', '')
                     except:
                         pass  # Not a valid JSON completion, continue with normal processing
                 
@@ -1016,45 +1303,228 @@ Evaluate: Is there anything else needed to fulfill the BA specification requirem
                     self.logger.info("Coding Agent signaled completion")
                     break
                 
-                # Extract and parse the file change instruction
+                # Extract and parse the operation instruction
                 try:
                     # Extract JSON from response, handling any surrounding text
                     json_content = self._extract_json_from_response(response_text)
-                    file_change = json.loads(json_content)
+                    operation_request = json.loads(json_content)
                     
-                    # Validate file change format
-                    if not self._validate_file_change(file_change):
-                        raise ValueError("Invalid file change format")
+                    # Validate operation format
+                    if not self._validate_operation_request(operation_request):
+                        raise ValueError("Invalid operation format")
                     
-                    file_changes.append(file_change)
+                    operation = operation_request.get('operation', 'write_file')
+                    
+                    # Handle different operation types
+                    if operation == 'get_file':
+                        # Handle file request
+                        file_path = operation_request.get('file_path')
+                        reason = operation_request.get('reason', 'File requested')
+                        
+                        self.logger.info(f"Coding agent requested file: {file_path} - {reason}")
+                        
+                        # Algorithmic restraint: prevent infinite loops
+                        if last_get_file_request == file_path and file_path not in file_modification_tracking:
+                            self.logger.warning(f"Agent requested same file '{file_path}' twice in a row without changes - terminating to prevent loop")
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM: AUTOMATIC TERMINATION - You requested the same file '{file_path}' twice in a row without making any changes. This suggests you may be stuck in a loop. Please review the BA specification and focus on the specific task requirements.")
+                            break
+                        
+                        last_get_file_request = file_path
+                        
+                        # Check if file was already provided and hasn't been modified
+                        if (file_path in provided_files and 
+                            file_path not in file_modification_tracking):
+                            
+                            # File already provided and hasn't been modified since
+                            self.logger.info(f"File {file_path} already provided in this conversation")
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM: File '{file_path}' was already provided earlier in this conversation and hasn't been modified since. The content remains:\n\n```\n{provided_files[file_path]}\n```\n\nPlease proceed with your changes or request a different file if needed.")
+                        
+                        else:
+                            # Get fresh file content
+                            try:
+                                file_content = git_manager.get_file_content(file_path)
+                                if file_content is not None:
+                                    # Cache the file content
+                                    provided_files[file_path] = file_content
+                                    # Clear modification tracking since we're providing fresh content
+                                    file_modification_tracking.pop(file_path, None)
+                                    
+                                    # Add file content to conversation history
+                                    conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                                    conversation_history.append(f"SYSTEM: File '{file_path}' content:\n\n```\n{file_content}\n```\n\nWhat would you like to do with this file?")
+                                else:
+                                    conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                                    conversation_history.append(f"SYSTEM ERROR: File '{file_path}' not found. Please check the file path or create the file if needed.")
+                            except Exception as e:
+                                conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                                conversation_history.append(f"SYSTEM ERROR: Could not read file '{file_path}': {str(e)}")
+                    
+                    elif operation == 'replace_lines':
+                        # Handle line replacement
+                        file_path = operation_request.get('file_path')
+                        start_line = operation_request.get('start_line')
+                        end_line = operation_request.get('end_line')
+                        new_content = operation_request.get('new_content', '')
+                        
+                        self.logger.info(f"Coding agent replacing lines {start_line}-{end_line} in {file_path}")
+                        
+                        # Algorithmic restraint: prevent infinite loops for replace_lines
+                        if (last_replace_operation and 
+                            last_replace_operation.get('operation') == 'replace_lines' and
+                            last_replace_operation.get('file_path') == file_path and
+                            last_replace_operation.get('start_line') == start_line and
+                            last_replace_operation.get('end_line') == end_line and
+                            last_replace_operation.get('new_content') == new_content):
+                            
+                            self.logger.warning(f"Agent repeated same replace_lines operation - terminating to prevent loop")
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM: AUTOMATIC TERMINATION - You repeated the same replace_lines operation. This suggests you may be stuck in a loop. Please review the current file state and try a different approach or signal completion with 'CHANGES DONE'.")
+                            break
+                        
+                        # Prevent massive replacements that could corrupt file structure
+                        lines_to_replace = end_line - start_line + 1
+                        if lines_to_replace > 50:  # More than 50 lines
+                            self.logger.warning(f"Agent attempting to replace {lines_to_replace} lines - this may indicate confusion about file structure")
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM: WARNING - You're attempting to replace {lines_to_replace} lines. This is a very large change that may corrupt the file structure. Consider using smaller, more targeted replacements or 'create_file' if you need to rewrite most of the file. Please reconsider your approach.")
+                            continue
+                        
+                        try:
+                            success, updated_content = git_manager.replace_file_lines(file_path, start_line, end_line, new_content)
+                            if success:
+                                file_changes.append(operation_request)
+                                
+                                # Update file cache with new content
+                                provided_files[file_path] = updated_content
+                                # Mark file as modified so agent knows it's been changed
+                                file_modification_tracking[file_path] = True
+                                # Reset loop detection since agent made a change
+                                last_get_file_request = None
+                                last_replace_operation = operation_request
+                                
+                                conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                                conversation_history.append(f"SYSTEM: Successfully replaced lines {start_line}-{end_line} in '{file_path}'. Updated file content:\n\n```\n{updated_content}\n```\n\nIs there anything else needed to fulfill the BA specification, or are you ready to respond with 'CHANGES DONE'?")
+                            else:
+                                conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                                conversation_history.append(f"SYSTEM ERROR: Failed to replace lines {start_line}-{end_line} in '{file_path}'. Please check line numbers and try again.")
+                        except Exception as e:
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM ERROR: Could not replace lines in '{file_path}': {str(e)}")
+                    
+                    elif operation == 'find_and_replace':
+                        # Handle find and replace operation
+                        file_path = operation_request.get('file_path')
+                        find_regex = operation_request.get('find_regex')
+                        replace_text = operation_request.get('replace_text')
+                        reason = operation_request.get('reason', 'Text replacement')
+                        
+                        self.logger.info(f"Coding agent find_and_replace in {file_path}: {reason}")
+                        
+                        # Validate required parameters
+                        if not file_path or find_regex is None or replace_text is None:
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM ERROR: find_and_replace operation requires 'file_path', 'find_regex', and 'replace_text' parameters.")
+                            continue
+                        
+                        # Algorithmic restraint: prevent infinite loops for find_and_replace
+                        if (last_replace_operation and 
+                            last_replace_operation.get('operation') == 'find_and_replace' and
+                            last_replace_operation.get('file_path') == file_path and
+                            last_replace_operation.get('find_regex') == find_regex and
+                            last_replace_operation.get('replace_text') == replace_text):
+                            
+                            self.logger.warning(f"Agent repeated same find_and_replace operation - terminating to prevent loop")
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM: AUTOMATIC TERMINATION - You repeated the same find_and_replace operation. This suggests you may be stuck in a loop. Please review the current file state and try a different approach or signal completion with 'CHANGES DONE'.")
+                            break
+                        
+                        try:
+                            success, message = git_manager.find_and_replace_in_file(file_path, find_regex, replace_text)
+                            if success:
+                                file_changes.append(operation_request)
+                                
+                                # Get updated file content for cache
+                                updated_content = git_manager.get_file_content(file_path)
+                                if updated_content is not None:
+                                    # Update file cache with new content
+                                    provided_files[file_path] = updated_content
+                                    # Mark file as modified so agent knows it's been changed
+                                    file_modification_tracking[file_path] = True
+                                    # Reset loop detection since agent made a change
+                                    last_get_file_request = None
+                                    last_replace_operation = operation_request
+                                    
+                                    conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                                    conversation_history.append(f"SYSTEM: Successfully replaced text in '{file_path}'. Updated file content:\n\n```\n{updated_content}\n```\n\nIs there anything else needed to fulfill the BA specification, or are you ready to respond with 'CHANGES DONE'?")
+                                else:
+                                    conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                                    conversation_history.append(f"SYSTEM: Text replacement succeeded but could not read updated file content. Please verify the change was applied correctly.")
+                            else:
+                                conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                                conversation_history.append(f"SYSTEM ERROR: {message}")
+                        except Exception as e:
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM ERROR: Could not perform find_and_replace in '{file_path}': {str(e)}")
+                    
+                    else:
+                        # Handle traditional file operations (write_file, create_file, delete_file, copy_file)
+                        file_changes.append(operation_request)
                     
                     # Log received operation based on type
-                    operation = file_change.get('operation', 'write_file')
                     if operation == 'copy_file':
-                        source_path = file_change.get('source_path')
-                        target_path = file_change.get('target_path')
+                        source_path = operation_request.get('source_path')
+                        target_path = operation_request.get('target_path')
                         self.logger.info(f"Received {operation} operation: {source_path} -> {target_path}")
-                    else:
-                        file_path = file_change.get('file_path')
-                        self.logger.info(f"Received {operation} operation for: {file_path}")
-                    
-                    # Add confirmation to conversation history
-                    conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
-                    if operation == 'copy_file':
+                        
+                        # Update cache for copied file - remove it since we don't know the new content without reading
+                        if target_path in provided_files:
+                            del provided_files[target_path]
+                        file_modification_tracking[target_path] = True
+                        
+                        conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
                         conversation_history.append(f"SYSTEM: {operation} operation for '{source_path}' -> '{target_path}' completed successfully. Is there anything else needed to fulfill the BA specification, or are you ready to respond with 'CHANGES DONE'?")
-                    else:
+                        
+                    elif operation in ['write_file', 'create_file']:
+                        file_path = operation_request.get('file_path')
+                        file_content = operation_request.get('file_content', '')
+                        self.logger.info(f"Received {operation} operation for: {file_path}")
+                        
+                        # Update cache with new content for write/create operations
+                        provided_files[file_path] = file_content
+                        file_modification_tracking[file_path] = True
+                        
+                        conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
                         conversation_history.append(f"SYSTEM: {operation} operation for '{file_path}' completed successfully. Is there anything else needed to fulfill the BA specification, or are you ready to respond with 'CHANGES DONE'?")
+                        
+                    elif operation == 'delete_file':
+                        file_path = operation_request.get('file_path')
+                        self.logger.info(f"Received {operation} operation for: {file_path}")
+                        
+                        # Remove from cache since file is deleted
+                        if file_path in provided_files:
+                            del provided_files[file_path]
+                        file_modification_tracking.pop(file_path, None)
+                        
+                        conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                        conversation_history.append(f"SYSTEM: {operation} operation for '{file_path}' completed successfully. Is there anything else needed to fulfill the BA specification, or are you ready to respond with 'CHANGES DONE'?")
+                    
+                    else:
+                        # Unknown operation
+                        conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                        conversation_history.append(f"SYSTEM ERROR: Unknown operation '{operation}'. Supported operations: get_file, find_and_replace, write_file, create_file, delete_file, copy_file, complete.")
                     
                 except json.JSONDecodeError as e:
                     self.logger.error(f"Turn {turn_number}: Invalid JSON response: {str(e)}")
                     # Don't log raw response to avoid Unicode encoding issues
                     conversation_history.append(f"ASSISTANT TURN {turn_number}: [Response contained invalid JSON]")
-                    conversation_history.append(f"SYSTEM ERROR: Invalid JSON format. Please provide a valid JSON response with 'operation' and required fields (file_path/file_content for write/create, source_path/target_path for copy), or 'CHANGES DONE' if all BA requirements are fulfilled.")
+                    conversation_history.append(f"SYSTEM ERROR: Invalid JSON format. Please provide a valid JSON response with 'operation' and required fields (get_file: file_path; find_and_replace: file_path/find_regex/replace_text; write_file/create_file: file_path/file_content; copy_file: source_path/target_path), or 'CHANGES DONE' if all BA requirements are fulfilled.")
                 
                 except ValueError as e:
                     self.logger.error(f"Turn {turn_number}: Invalid operation format: {str(e)}")
                     conversation_history.append(f"ASSISTANT TURN {turn_number}: [Response contained invalid operation]")
-                    conversation_history.append(f"SYSTEM ERROR: Invalid operation format. Please provide JSON with 'operation' (write_file/create_file/delete_file/copy_file), required fields, or 'CHANGES DONE' if all BA requirements are fulfilled.")
+                    conversation_history.append(f"SYSTEM ERROR: Invalid operation format. Please provide JSON with 'operation' (get_file/find_and_replace/write_file/create_file/delete_file/copy_file) and required fields, or 'CHANGES DONE' if all BA requirements are fulfilled.")
                 
                 turn_number += 1
                 
@@ -1064,38 +1534,69 @@ Evaluate: Is there anything else needed to fulfill the BA specification requirem
                     break
             
             self.logger.info(f"Coding Agent conversation completed after {turn_number-1} turns with {len(file_changes)} file changes")
-            return file_changes
+            
+            # Return both file changes and completion summary
+            return {
+                'file_changes': file_changes,
+                'completion_summary': completion_summary
+            }
             
         except Exception as e:
             self.logger.error(f"Coding Agent iterative invocation failed: {e}")
             return []
     
-    def _validate_file_change(self, file_change: Dict) -> bool:
-        """Validate that file change has required fields for the specified operation"""
-        if not isinstance(file_change, dict):
+    def _validate_operation_request(self, operation_request: Dict) -> bool:
+        """Validate that operation request has required fields for the specified operation"""
+        if not isinstance(operation_request, dict):
             return False
         
-        operation = file_change.get('operation', 'write_file')  # Default to write_file for backward compatibility
+        operation = operation_request.get('operation', 'write_file')  # Default to write_file for backward compatibility
         
         # Validate based on operation type
-        if operation in ['write_file', 'create_file']:
+        if operation == 'get_file':
+            # Get file operations only need file_path
+            file_path = operation_request.get('file_path')
+            return file_path and isinstance(file_path, str)
+        
+        elif operation == 'replace_lines':
+            # Replace lines operations need file_path, start_line, end_line, and new_content
+            file_path = operation_request.get('file_path')
+            start_line = operation_request.get('start_line')
+            end_line = operation_request.get('end_line')
+            new_content = operation_request.get('new_content')
+            return (file_path and isinstance(file_path, str) and
+                   isinstance(start_line, int) and start_line > 0 and
+                   isinstance(end_line, int) and end_line > 0 and
+                   start_line <= end_line and
+                   new_content is not None and isinstance(new_content, str))
+        
+        elif operation in ['write_file', 'create_file']:
             # These operations require file_path and file_content
-            file_path = file_change.get('file_path')
-            file_content = file_change.get('file_content')
+            file_path = operation_request.get('file_path')
+            file_content = operation_request.get('file_content')
             return (file_path and isinstance(file_path, str) and 
                    file_content is not None and isinstance(file_content, str))
         
         elif operation == 'delete_file':
             # Delete operations only need file_path
-            file_path = file_change.get('file_path')
+            file_path = operation_request.get('file_path')
             return file_path and isinstance(file_path, str)
         
         elif operation == 'copy_file':
             # Copy operations need source_path and target_path
-            source_path = file_change.get('source_path')
-            target_path = file_change.get('target_path')
+            source_path = operation_request.get('source_path')
+            target_path = operation_request.get('target_path')
             return (source_path and isinstance(source_path, str) and
                    target_path and isinstance(target_path, str))
+        
+        elif operation == 'find_and_replace':
+            # Find and replace operations need file_path, find_regex, and replace_text
+            file_path = operation_request.get('file_path')
+            find_regex = operation_request.get('find_regex')
+            replace_text = operation_request.get('replace_text')
+            return (file_path and isinstance(file_path, str) and
+                   find_regex is not None and isinstance(find_regex, str) and
+                   replace_text is not None and isinstance(replace_text, str))
         
         else:
             # Unknown operation
@@ -1357,10 +1858,11 @@ class OrchestratorScript:
         """Handle failure by updating Jira ticket"""
         try:
             self.jira_manager.add_comment(ticket_key, f"Automated processing failed: {error_message}")
-            self.jira_manager.transition_ticket(ticket_key, "Failed")
-            self.logger.error(f"Marked ticket {ticket_key} as failed due to: {error_message}")
+            # Transition to "Pending" on failure/error (allows for retry)
+            self.jira_manager.transition_ticket(ticket_key, "Pending")
+            self.logger.error(f"Marked ticket {ticket_key} as pending due to: {error_message}")
         except Exception as e:
-            self.logger.error(f"Failed to update ticket {ticket_key} with failure status: {e}")
+            self.logger.error(f"Failed to update ticket {ticket_key} with pending status: {e}")
         
         # Stop server if running
         if self.server_manager:
@@ -1471,13 +1973,11 @@ class OrchestratorScript:
             self.logger.info("Creating feature branch")
             feature_branch_name = self.git_manager.create_feature_branch(ticket.key)
             
-            # Update Jira immediately with branch info
-            branch_comment = f"Processing started. Created feature branch: {feature_branch_name}"
-            self.jira_manager.add_comment(ticket.key, branch_comment)
-            self.logger.info("Updated Jira with branch information")
+            # Note: Branch comment will be added AFTER successful push to remote
+            self.logger.info(f"Created feature branch: {feature_branch_name}")
             
-            # 4. Load full codebase context AFTER switching to the correct branch
-            self.logger.info("Loading complete codebase context from current branch")
+            # 4. Load full codebase context for BA Agent only
+            self.logger.info("Loading complete codebase context for BA Agent")
             codebase_contents = self.git_manager.get_all_file_contents()
             
             # 5. Load instruction files
@@ -1485,7 +1985,7 @@ class OrchestratorScript:
             ba_instructions = self.instruction_manager.load_ba_instructions()
             coder_instructions = self.instruction_manager.load_coder_instructions()
             
-            # 6. Invoke BA Agent with full context
+            # 6. Invoke BA Agent with full context (BA still needs full context to understand project structure)
             self.logger.info("Invoking Business Analyst Agent with full codebase context")
             try:
                 ba_spec = self.ai_agent.invoke_ba_agent(ticket, ba_instructions, codebase_contents, self.temp_artifacts_path, attachments_info)
@@ -1503,12 +2003,17 @@ class OrchestratorScript:
                 self.handle_failure(ticket.key, f"BA Agent failed: {str(e)}")
                 return
             
-            # 7. Invoke Coding Agent with comprehensive context
-            self.logger.info("Invoking Coding Agent with comprehensive context")
+            # 7. Invoke Coding Agent with new request-based approach (no full codebase upfront)
+            self.logger.info("Invoking Coding Agent with request-based file access")
             try:
-                coding_changes = self.ai_agent.invoke_coding_agent_iterative(
-                    ticket, ba_spec, coder_instructions, codebase_contents, self.temp_artifacts_path
+                coding_result = self.ai_agent.invoke_coding_agent_iterative(
+                    ticket, ba_spec, coder_instructions, self.git_manager, self.temp_artifacts_path
                 )
+                
+                # Extract file changes and completion summary
+                coding_changes = coding_result.get('file_changes', [])
+                completion_summary = coding_result.get('completion_summary', '')
+                
             except Exception as e:
                 self.handle_failure(ticket.key, f"Coding Agent failed: {str(e)}")
                 return
@@ -1601,6 +2106,11 @@ class OrchestratorScript:
                         # Push branch
                         self.git_manager.push_branch(feature_branch_name)
                         
+                        # Add branch comment AFTER successful push to remote
+                        branch_comment = f"Processing started. Created and pushed feature branch: {feature_branch_name}"
+                        self.jira_manager.add_comment(ticket.key, branch_comment)
+                        self.logger.info("Added branch information to Jira ticket after successful push")
+                        
                         if failed_operations:
                             # Add comment about partial success
                             partial_comment = f"Implementation partially completed. {len(successful_operations)} changes applied successfully, {len(failed_operations)} failed (possibly already applied)."
@@ -1612,6 +2122,11 @@ class OrchestratorScript:
                             raise commit_error
                 else:
                     self.logger.info("No changes to commit - all patches either failed or were already applied")
+                    # Add branch comment even if no changes were made
+                    branch_comment = f"Processing started. Created and pushed feature branch: {feature_branch_name}"
+                    self.jira_manager.add_comment(ticket.key, branch_comment)
+                    self.logger.info("Added branch information to Jira ticket (no changes needed)")
+                    
                     # Still update Jira to indicate processing was attempted
                     no_changes_comment = f"Processing completed - no new changes needed. All requested modifications appear to already be in place."
                     self.jira_manager.add_comment(ticket.key, no_changes_comment)
@@ -1653,16 +2168,25 @@ class OrchestratorScript:
                     if failed_operations:
                         commit_message += f" (partial - {len(failed_operations)} operations failed)"
 
+                # Add completion summary if provided
+                summary_section = ""
+                if completion_summary:
+                    summary_section = f"\n**Changes Summary:**\n{completion_summary}\n"
+
                 completion_comment = f"""Automated implementation completed.
 
 **Branch:** {feature_branch_name}
 **Commit:** {commit_message}
-**Local Server:** {server_url if server_url else 'Not available'}
-
+**Local Server:** {server_url if server_url else 'Not available'}{summary_section}
 Ready for review and testing."""
                 
                 self.jira_manager.add_comment(ticket.key, completion_comment)
-                self.jira_manager.transition_ticket(ticket.key, "Done")
+                
+                # Jira Status Transition Rules:
+                # - "In Progress": Set when ticket is picked up (line 1835)
+                # - "Resolved": Set on successful implementation completion
+                # - "Pending": Set on failure/error (handled in handle_failure method)
+                self.jira_manager.transition_ticket(ticket.key, "Resolved")
                 
                 self.logger.info(f"Successfully processed ticket {ticket.key}")
                 
