@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import base64
 import requests
+from utils.md_to_jira import convert_to_jira_wiki
 
 # Third-party imports
 import google.generativeai as genai
@@ -1365,7 +1366,7 @@ Please provide your business analysis following the markdown format specified in
     
     def invoke_coding_agent_iterative(self, ticket: JiraTicket, ba_spec: str, 
                                       instructions: str, git_manager: 'GitManager', 
-                                      temp_artifacts_path: Path) -> List[Dict[str, Any]]:
+                                      temp_artifacts_path: Path, attachments_path: Path) -> List[Dict[str, Any]]:
         """Invoke the Coding Agent with iterative conversation approach"""
         
         file_changes = []
@@ -1677,67 +1678,54 @@ Start by requesting the files you need to examine, then make the necessary chang
                     elif operation == 'copy_file':
                         source_path = operation_request.get('source_path')
                         target_path = operation_request.get('target_path')
-                        self.logger.info(f"Received {operation} operation: {source_path} -> {target_path}")
+                        self.logger.info(f"Executing {operation} operation: {source_path} -> {target_path}")
                         
-                        # CRITICAL FIX: Add operation to file_changes so it gets executed
-                        file_changes.append(operation_request)
-                        
-                        # Update cache for copied file - remove it since we don't know the new content without reading
-                        if target_path in provided_files:
-                            del provided_files[target_path]
-                        file_modification_tracking[target_path] = True
-                        
-                        conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
-                        conversation_history.append(f"SYSTEM: {operation} operation for '{source_path}' -> '{target_path}' completed successfully. Is there anything else needed to fulfill the BA specification, or are you ready to respond with 'CHANGES DONE'?")
+                        success = git_manager.copy_file(source_path, target_path, attachments_path)
+                        if success:
+                            file_changes.append(operation_request)
+                            if target_path in provided_files:
+                                del provided_files[target_path]
+                            file_modification_tracking[target_path] = True
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM: {operation} operation for '{source_path}' -> '{target_path}' completed successfully. What is your next action?")
+                        else:
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM ERROR: Failed to copy '{source_path}' to '{target_path}'. Please check the paths and try again.")
                         
                     elif operation in ['write_file', 'create_file']:
                         file_path = operation_request.get('file_path')
-                        file_content = operation_request.get('file_content', '')
-                        self.logger.info(f"Received {operation} operation for: {file_path}")
+                        # Accept both 'content' and 'file_content' for backward compatibility
+                        file_content = operation_request.get('file_content') or operation_request.get('content', '')
+                        self.logger.info(f"Executing {operation} operation for: {file_path}")
                         
-                        # CRITICAL FIX: Add operation to file_changes so it gets executed
-                        file_changes.append(operation_request)
-                        
-                        # Update cache with new content for write/create operations
-                        provided_files[file_path] = file_content
-                        file_modification_tracking[file_path] = True
-                        
-                        conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
-                        conversation_history.append(f"SYSTEM: {operation} operation for '{file_path}' completed successfully. Is there anything else needed to fulfill the BA specification, or are you ready to respond with 'CHANGES DONE'?")
+                        success = git_manager.write_file_content(file_path, file_content)
+                        if success:
+                            file_changes.append(operation_request)
+                            provided_files[file_path] = file_content
+                            file_modification_tracking[file_path] = True
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM: {operation} operation for '{file_path}' completed successfully. The file content has been updated. What is your next action?")
+                        else:
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM ERROR: Failed to write to file '{file_path}'.")
                         
                     elif operation == 'delete_file':
                         file_path = operation_request.get('file_path')
-                        self.logger.info(f"Received {operation} operation for: {file_path}")
+                        self.logger.info(f"Executing {operation} operation for: {file_path}")
                         
-                        # CRITICAL FIX: Add operation to file_changes so it gets executed
-                        file_changes.append(operation_request)
-                        
-                        # Remove from cache since file is deleted
-                        if file_path in provided_files:
-                            del provided_files[file_path]
-                        file_modification_tracking.pop(file_path, None)
-                        
-                        conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
-                        conversation_history.append(f"SYSTEM: {operation} operation for '{file_path}' completed successfully. Is there anything else needed to fulfill the BA specification, or are you ready to respond with 'CHANGES DONE'?")
+                        success = git_manager.delete_file(file_path)
+                        if success:
+                            file_changes.append(operation_request)
+                            if file_path in provided_files:
+                                del provided_files[file_path]
+                            file_modification_tracking.pop(file_path, None)
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM: {operation} operation for '{file_path}' completed successfully. What is your next action?")
+                        else:
+                            conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
+                            conversation_history.append(f"SYSTEM ERROR: Failed to delete file '{file_path}'.")
                     
-                    elif operation == 'find_and_replace':
-                        file_path = operation_request.get('file_path')
-                        find_regex = operation_request.get('find_regex')
-                        replace_text = operation_request.get('replace_text')
-                        if not file_path:
-                            failed_operations.append(f"unknown: Missing file_path for find_and_replace operation")
-                            continue
-                        if not find_regex:
-                            failed_operations.append(f"{file_path}: Missing find_regex for find_and_replace operation")
-                            continue
-                        if replace_text is None:
-                            failed_operations.append(f"{file_path}: Missing replace_text for find_and_replace operation")
-                            continue
-                        success, message = self.git_manager.find_and_replace_in_file(file_path, find_regex, replace_text)
-                        if not success:
-                            failed_operations.append(f"{file_path}: {message}")
-                            continue
-                        
+                   
                     else:
                         # Unknown operation
                         conversation_history.append(f"ASSISTANT TURN {turn_number}: {response_text}")
@@ -1802,9 +1790,9 @@ Start by requesting the files you need to examine, then make the necessary chang
                    new_content is not None and isinstance(new_content, str))
         
         elif operation in ['write_file', 'create_file']:
-            # These operations require file_path and file_content
+            # These operations require file_path and file_content (or content)
             file_path = operation_request.get('file_path')
-            file_content = operation_request.get('file_content')
+            file_content = operation_request.get('file_content') or operation_request.get('content')
             return (file_path and isinstance(file_path, str) and 
                    file_content is not None and isinstance(file_content, str))
         
@@ -2265,13 +2253,11 @@ class OrchestratorScript:
             try:
                 ba_spec = self.ai_agent.invoke_ba_agent(ticket, ba_instructions, codebase_contents, self.temp_artifacts_path, attachments_info)
                 
+                # Convert BA spec to Jira wiki format for proper rendering
+                jira_formatted_spec = convert_to_jira_wiki(ba_spec)
+                
                 # Add BA specification to Jira as comment
-                ba_spec_comment = f"""**Business Analyst Specification Generated:**
-
-{ba_spec}
-
----"""
-                self.jira_manager.add_comment(ticket.key, ba_spec_comment)
+                self.jira_manager.add_comment(ticket.key, jira_formatted_spec)
                 self.logger.info("Added BA specification to Jira ticket")
                 
             except Exception as e:
@@ -2282,7 +2268,7 @@ class OrchestratorScript:
             self.logger.info("Invoking Coding Agent with request-based file access")
             try:
                 coding_result = self.ai_agent.invoke_coding_agent_iterative(
-                    ticket, ba_spec, coder_instructions, self.git_manager, self.temp_artifacts_path
+                    ticket, ba_spec, coder_instructions, self.git_manager, self.temp_artifacts_path, self.attachments_path
                 )
                 
                 # Extract file changes and completion summary
@@ -2293,139 +2279,39 @@ class OrchestratorScript:
                 self.handle_failure(ticket.key, f"Coding Agent failed: {str(e)}")
                 return
             
-            # 8. Apply Code Changes
-            self.logger.info("Applying code changes")
+            # 8. Commit Changes (if any were made)
+            self.logger.info("Committing changes")
             try:
-                successful_operations = []
-                failed_operations = []
-                
-                # Apply each file operation
-                if coding_changes:
-                    for change in coding_changes:
-                        operation = change.get('operation', 'write_file')  # Default for backward compatibility
-                        
-                        success = False
-                        
-                        if operation == 'write_file':
-                            file_path = change.get('file_path')
-                            file_content = change.get('file_content')
-                            if not file_path:
-                                failed_operations.append(f"unknown: Missing file_path for write_file operation")
-                                continue
-                            if file_content is None:
-                                failed_operations.append(f"{file_path}: Missing file_content for write_file operation")
-                                continue
-                            success = self.git_manager.write_file_content(file_path, file_content)
-                            
-                        elif operation == 'create_file':
-                            file_path = change.get('file_path')
-                            file_content = change.get('file_content')
-                            if not file_path:
-                                failed_operations.append(f"unknown: Missing file_path for create_file operation")
-                                continue
-                            if file_content is None:
-                                failed_operations.append(f"{file_path}: Missing file_content for create_file operation")
-                                continue
-                            success = self.git_manager.create_file(file_path, file_content)
-                            
-                        elif operation == 'delete_file':
-                            file_path = change.get('file_path')
-                            if not file_path:
-                                failed_operations.append(f"unknown: Missing file_path for delete_file operation")
-                                continue
-                            success = self.git_manager.delete_file(file_path)
-                            
-                        elif operation == 'copy_file':
-                            source_path = change.get('source_path')
-                            target_path = change.get('target_path')
-                            if source_path is None or target_path is None:
-                                failed_operations.append(f"{target_path or source_path or 'unknown'}: Missing source_path or target_path for copy_file operation")
-                                continue
-                            success = self.git_manager.copy_file(source_path, target_path, self.attachments_path)
-                            
-                        elif operation == 'find_and_replace':
-                            file_path = change.get('file_path')
-                            find_regex = change.get('find_regex')
-                            replace_text = change.get('replace_text')
-                            if not file_path:
-                                failed_operations.append(f"unknown: Missing file_path for find_and_replace operation")
-                                continue
-                            if not find_regex:
-                                failed_operations.append(f"{file_path}: Missing find_regex for find_and_replace operation")
-                                continue
-                            if replace_text is None:
-                                failed_operations.append(f"{file_path}: Missing replace_text for find_and_replace operation")
-                                continue
-                            success, message = self.git_manager.find_and_replace_in_file(file_path, find_regex, replace_text)
-                            if not success:
-                                failed_operations.append(f"{file_path}: {message}")
-                                continue
-                            
-                        else:
-                            failed_operations.append(f"unknown: Unknown operation '{operation}'")
-                            continue
-                        
-                        if success:
-                            if operation == 'copy_file':
-                                successful_operations.append(f"{operation}:{source_path}->{target_path}")
-                            elif operation in ['write_file', 'create_file', 'delete_file', 'find_and_replace']:
-                                successful_operations.append(f"{operation}:{file_path}")
-                            else:
-                                successful_operations.append(f"{operation}:unknown")
-                        else:
-                            if operation == 'copy_file':
-                                failed_operations.append(f"{target_path}: {operation} operation failed")
-                            elif operation in ['write_file', 'create_file', 'delete_file', 'find_and_replace']:
-                                failed_operations.append(f"{file_path}: {operation} operation failed")
-                            else:
-                                failed_operations.append(f"unknown: {operation} operation failed")
-                
-                # Log results
-                if successful_operations:
-                    self.logger.info(f"Successfully completed operations: {', '.join(successful_operations)}")
-                if failed_operations:
-                    self.logger.warning(f"Failed operations: {', '.join(failed_operations)}")
-                
-                # Only commit if we have some changes (either successful operations or existing changes)
-                if successful_operations or self._has_uncommitted_changes():
+                # Only commit if we have some changes (either from successful operations or existing uncommitted changes)
+                if coding_changes or self._has_uncommitted_changes():
                     # Commit changes
                     commit_message = f"feat({ticket.key}): {ticket.summary}"
-                    if failed_operations:
-                        commit_message += f" (partial - {len(failed_operations)} operations failed)"
+                    if completion_summary:
+                        commit_message += f" - {completion_summary}"
+
+                    self.git_manager.commit_changes(commit_message)
                     
-                    try:
-                        self.git_manager.commit_changes(commit_message)
-                        
-                        # Push branch
-                        self.git_manager.push_branch(feature_branch_name)
-                        
-                        # Add branch comment AFTER successful push to remote
-                        branch_comment = f"Processing started. Created and pushed feature branch: {feature_branch_name}"
-                        self.jira_manager.add_comment(ticket.key, branch_comment)
-                        self.logger.info("Added branch information to Jira ticket after successful push")
-                        
-                        if failed_operations:
-                            # Add comment about partial success
-                            partial_comment = f"Implementation partially completed. {len(successful_operations)} changes applied successfully, {len(failed_operations)} failed (possibly already applied)."
-                            self.jira_manager.add_comment(ticket.key, partial_comment)
-                    except Exception as commit_error:
-                        if "nothing to commit" in str(commit_error).lower():
-                            self.logger.info("No new changes to commit - all changes appear to already be applied")
-                        else:
-                            raise commit_error
+                    # Push branch
+                    self.git_manager.push_branch(feature_branch_name)
+                    
+                    # Add final comment to Jira
+                    final_comment = f"""Development complete and pushed to branch: `{feature_branch_name}`
+                    
+**Completion Summary:**
+{completion_summary if completion_summary else 'No summary provided.'}
+"""
+                    self.jira_manager.add_comment(ticket.key, final_comment)
+                    
+                    # Transition ticket to "Resolved"
+                    self.jira_manager.transition_ticket(ticket.key, "Resolved")
+                    
                 else:
-                    self.logger.info("No changes to commit - all patches either failed or were already applied")
-                    # Add branch comment even if no changes were made
-                    branch_comment = f"Processing started. Created and pushed feature branch: {feature_branch_name}"
-                    self.jira_manager.add_comment(ticket.key, branch_comment)
-                    self.logger.info("Added branch information to Jira ticket (no changes needed)")
-                    
-                    # Still update Jira to indicate processing was attempted
-                    no_changes_comment = f"Processing completed - no new changes needed. All requested modifications appear to already be in place."
-                    self.jira_manager.add_comment(ticket.key, no_changes_comment)
-                
+                    self.logger.info("No changes were made by the coding agent. Nothing to commit.")
+                    # Add a comment to Jira indicating no changes were made
+                    self.jira_manager.add_comment(ticket.key, "Coding agent made no changes to the codebase.")
+
             except Exception as e:
-                self.handle_failure(ticket.key, f"Git operations failed: {str(e)}")
+                self.handle_failure(ticket.key, f"Failed to commit or push changes: {str(e)}")
                 return
             
             # 9. Launch Local Development Server
@@ -2456,10 +2342,10 @@ class OrchestratorScript:
                     pass # Keep the real one
                 
                 # We need to re-capture the commit message if it was created inside the try block
-                if successful_operations or self._has_uncommitted_changes():
+                if coding_changes or self._has_uncommitted_changes():
                     commit_message = f"feat({ticket.key}): {ticket.summary}"
-                    if failed_operations:
-                        commit_message += f" (partial - {len(failed_operations)} operations failed)"
+                    if completion_summary:
+                        commit_message += f" - {completion_summary}"
 
                 # Add completion summary if provided
                 summary_section = ""

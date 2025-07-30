@@ -3,6 +3,7 @@
 *.env
 
 # Workspace directory
+attachments/
 workspace/
 workspaces/
 temp_artifacts/
